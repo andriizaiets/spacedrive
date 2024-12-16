@@ -33,7 +33,16 @@ const Profile = ({
 }) => {
 	const emailName = user.email?.split('@')[0];
 	const capitalizedEmailName = (emailName?.charAt(0).toUpperCase() ?? '') + emailName?.slice(1);
-	const { accessToken, refreshToken } = getTokens();
+	const [accessToken, setAccessToken] = useState('');
+	const [refreshToken, setRefreshToken] = useState('');
+
+	useEffect(() => {
+		(async () => {
+			const tokens = await getTokens();
+			setAccessToken(tokens.accessToken);
+			setRefreshToken(tokens.refreshToken);
+		})();
+	}, []);
 
 	const cloudBootstrap = useBridgeMutation('cloud.bootstrap');
 	const devices = useBridgeQuery(['cloud.devices.list']);
@@ -50,6 +59,7 @@ const Profile = ({
 	const listSyncGroups = useBridgeQuery(['cloud.syncGroups.list']);
 	const requestJoinSyncGroup = useBridgeMutation('cloud.syncGroups.request_join');
 	const currentDevice = useBridgeQuery(['cloud.devices.get_current_device']);
+	const hasBootstrapped = useBridgeQuery(['cloud.hasBootstrapped']);
 
 	// Refetch libraries and devices every 10 seconds
 	useEffect(() => {
@@ -119,14 +129,16 @@ const Profile = ({
 
 			{/* Debug Buttons */}
 			<div className="flex gap-2">
-				<Button
-					variant="gray"
-					onClick={async () => {
-						cloudBootstrap.mutate([accessToken.trim(), refreshToken.trim()]);
-					}}
-				>
-					Start Cloud Bootstrap
-				</Button>
+				{!hasBootstrapped.data && (
+					<Button
+						variant="gray"
+						onClick={async () => {
+							cloudBootstrap.mutate([accessToken.trim(), refreshToken.trim()]);
+						}}
+					>
+						Start Cloud Bootstrap
+					</Button>
+				)}
 				<Button
 					variant="gray"
 					onClick={async () => {
