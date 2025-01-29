@@ -1,5 +1,5 @@
 import { FolderNotchOpen } from '@phosphor-icons/react';
-import { CSSProperties, type PropsWithChildren, type ReactNode } from 'react';
+import { CSSProperties, useEffect, type PropsWithChildren, type ReactNode } from 'react';
 import {
 	explorerLayout,
 	useExplorerLayoutStore,
@@ -34,6 +34,11 @@ interface Props {
 	contextMenu?: () => ReactNode;
 }
 
+declare global {
+	interface Window {
+		useDragAndDrop: () => void;
+	}
+}
 /**
  * This component is used in a few routes and acts as the reference demonstration of how to combine
  * all the elements of the explorer except for the context, which must be used in the parent component.
