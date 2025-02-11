@@ -56,23 +56,29 @@ export const commands = {
 	 * * `window` - The Tauri window instance
 	 * * `_state` - Current drag state (unused)
 	 * * `files` - Vector of file paths to be dragged
-	 * * `icon_path` - Path to the preview icon for the drag operation
+	 * * `image` - Base64 encoded image to be used as drag icon
 	 * * `on_event` - Channel for communicating drag operation events back to the frontend
 	 */
 	async startDrag(
 		files: string[],
-		iconPath: string,
+		image: string,
 		onEvent: TAURI_CHANNEL<CallbackResult>
 	): Promise<Result<null, string>> {
 		try {
 			return {
 				status: 'ok',
-				data: await TAURI_INVOKE('start_drag', { files, iconPath, onEvent })
+				data: await TAURI_INVOKE('start_drag', { files, image, onEvent })
 			};
 		} catch (e) {
 			if (e instanceof Error) throw e;
 			else return { status: 'error', error: e as any };
 		}
+	},
+	/**
+	 * Stops the cursor position tracking for drag operations
+	 */
+	async stopDrag(): Promise<void> {
+		await TAURI_INVOKE('stop_drag');
 	},
 	async openFilePaths(
 		library: string,

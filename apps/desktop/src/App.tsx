@@ -89,6 +89,10 @@ function useDragAndDrop() {
 		});
 
 		(async () => {
+			if (['linux', 'browser'].includes(await platform.getOs())) {
+				console.log('Skipping drag operation on Linux or Browser');
+				return;
+			}
 			if (dragState?.type === 'dragging' && dragState.items.length > 0) {
 				console.log('Starting drag operation with items:', dragState.items);
 
@@ -112,9 +116,6 @@ function useDragAndDrop() {
 						};
 					})
 				);
-
-				const image = Transparent.split('/@fs')[1]!;
-				console.log('Using preview image:', image);
 
 				const validFiles = items.filter(Boolean).map((item) => item?.file_path);
 				console.log('Invoking start_drag with files:', validFiles);
@@ -145,9 +146,13 @@ function useDragAndDrop() {
 						explorerStore.drag = null;
 					};
 
+					const image = !Transparent.includes('/@fs/')
+						? Transparent
+						: Transparent.replace('/@fs', '');
+
 					await invoke('start_drag', {
 						files: validFiles,
-						iconPath: image,
+						image: image,
 						onEvent: channel
 					});
 					console.log('start_drag invoked successfully');
@@ -155,6 +160,9 @@ function useDragAndDrop() {
 					console.error('Failed to start drag:', error);
 					explorerStore.drag = null;
 				}
+			} else {
+				console.log('Drag operation cancelled');
+				await invoke('stop_drag');
 			}
 		})();
 	}, [dragState]);

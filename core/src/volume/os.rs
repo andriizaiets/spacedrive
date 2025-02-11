@@ -27,7 +27,7 @@ mod common {
 	pub fn parse_size(size_str: &str) -> u64 {
 		size_str
 			.chars()
-			.filter(|c| c.is_digit(10))
+			.filter(|c| c.is_ascii_digit())
 			.collect::<String>()
 			.parse()
 			.unwrap_or(0)
@@ -189,139 +189,149 @@ pub mod macos {
 #[cfg(target_os = "linux")]
 pub mod linux {
 	use super::*;
-	use std::{fs, process::Command};
+	use std::{path::PathBuf, process::Command};
 	use sysinfo::{DiskExt, System, SystemExt};
 
 	pub async fn get_volumes() -> Result<Vec<Volume>, VolumeError> {
-		task::spawn_blocking(|| {
-			let mut volumes = Vec::new();
-			let mut sys = System::new_all();
-			sys.refresh_disks_list();
+		let disk_info: Vec<(String, bool, PathBuf, Vec<u8>, u64, u64)> =
+			tokio::task::spawn_blocking(|| {
+				let mut sys = System::new_all();
+				sys.refresh_disks_list();
 
-			// Read /proc/mounts for additional mount information
-			let mounts = fs::read_to_string("/proc/mounts").map_err(|e| {
-				VolumeError::Platform(format!("Failed to read /proc/mounts: {}", e))
-			})?;
+				sys.disks()
+					.iter()
+					.filter(|disk| {
+						!common::is_virtual_filesystem(
+							std::str::from_utf8(disk.file_system()).unwrap_or(""),
+						)
+					})
+					.map(|disk| {
+						(
+							disk.name().to_string_lossy().to_string(),
+							disk.is_removable(),
+							disk.mount_point().to_path_buf(),
+							disk.file_system().to_vec(),
+							disk.total_space(),
+							disk.available_space(),
+						)
+					})
+					.collect()
+			})
+			.await
+			.map_err(|e| VolumeError::Platform(format!("Task join error: {}", e)))?;
 
-			let mount_points: Vec<_> = mounts
-				.lines()
-				.filter(|line| !line.starts_with("none"))
-				.collect();
-
-			for disk in sys.disks() {
-				if common::is_virtual_filesystem(
-					disk.file_system().to_string_lossy().to_string().as_str(),
-				) {
-					continue;
-				}
-
-				let volume = create_volume_from_disk(disk, &mount_points).map_err(|e| {
-					VolumeError::Platform(format!("Failed to create volume: {}", e))
-				})?;
-				volumes.push(volume);
+		let mut volumes = Vec::new();
+		for (name, is_removable, mount_point, file_system, total_space, available_space) in
+			disk_info
+		{
+			if !mount_point.exists() {
+				continue;
 			}
 
-			Ok(volumes)
-		})
-		.await
-		.map_err(|e| VolumeError::Platform(format!("Task join error: {}", e)))?
+			let read_only = is_volume_readonly(&mount_point)?;
+			let disk_type = detect_disk_type(&name)?;
+
+			volumes.push(Volume::new(
+				name,
+				if is_removable {
+					MountType::External
+				} else {
+					MountType::System
+				},
+				mount_point.clone(),
+				vec![mount_point],
+				disk_type,
+				FileSystem::from_string(&String::from_utf8_lossy(&file_system)),
+				total_space,
+				available_space,
+				read_only,
+			));
+		}
+
+		Ok(volumes)
 	}
 
-	fn create_volume_from_disk(
-		disk: &sysinfo::Disk,
-		mount_points: &[&str],
-	) -> Result<Volume, VolumeError> {
-		let mount_point = disk.mount_point().to_path_buf();
-
-		let mount_info = mount_points
-			.iter()
-			.find(|&line| line.contains(&mount_point.to_string_lossy()))
-			.ok_or_else(|| VolumeError::NoMountPoint)?;
-
-		let is_network = mount_info.starts_with("//") || mount_info.starts_with("nfs");
-		let disk_type = detect_disk_type(&disk.name().to_string_lossy())
-			.map_err(|e| VolumeError::Platform(format!("Failed to detect disk type: {}", e)))?;
-
-		Ok(Volume::new(
-			disk.name().to_string_lossy().to_string(),
-			if is_network {
-				MountType::Network
-			} else if disk.is_removable() {
-				MountType::External
-			} else {
-				MountType::System
+	fn detect_disk_type(device_name: &str) -> Result<DiskType, VolumeError> {
+		let path = format!(
+			"/sys/block/{}/queue/rotational",
+			device_name.trim_start_matches("/dev/")
+		);
+		match std::fs::read_to_string(path) {
+			Ok(contents) => match contents.trim() {
+				"0" => Ok(DiskType::SSD),
+				"1" => Ok(DiskType::HDD),
+				_ => Ok(DiskType::Unknown),
 			},
-			mount_point,
-			disk_type,
-			FileSystem::from_string(&disk.file_system().to_string_lossy()),
-			disk.total_space(),
-			disk.available_space(),
-		))
+			Err(_) => Ok(DiskType::Unknown),
+		}
 	}
-	pub async fn unmount_volume(path: &std::path::Path) -> Result<(), VolumeError> {
-		use tokio::process::Command;
 
-		// Try umount first
-		let result = Command::new("umount")
+	fn is_volume_readonly(mount_point: &std::path::Path) -> Result<bool, VolumeError> {
+		let output = Command::new("findmnt")
+			.args([
+				"--noheadings",
+				"--output",
+				"OPTIONS",
+				mount_point.to_str().unwrap(),
+			])
+			.output()
+			.map_err(|e| VolumeError::Platform(format!("Failed to run findmnt: {}", e)))?;
+
+		let options = String::from_utf8_lossy(&output.stdout);
+		Ok(options.contains("ro,") || options.contains(",ro") || options.contains("ro "))
+	}
+
+	pub async fn unmount_volume(path: &std::path::Path) -> Result<(), VolumeError> {
+		// Try regular unmount first
+		let result = tokio::process::Command::new("umount")
 			.arg(path)
 			.output()
-			.await
-			.map_err(|e| VolumeError::Platform(format!("Unmount failed: {}", e)))?;
+			.await;
 
-		if result.status.success() {
-			Ok(())
-		} else {
-			// If regular unmount fails, try with force option
-			let force_result = Command::new("umount")
-				.arg("-f") // Force unmount
-				.arg(path)
-				.output()
-				.await
-				.map_err(|e| VolumeError::Platform(format!("Force unmount failed: {}", e)))?;
-
-			if force_result.status.success() {
-				Ok(())
-			} else {
-				// If both attempts fail, try udisksctl as a last resort
-				let udisks_result = Command::new("udisksctl")
-					.arg("unmount")
-					.arg("-b")
-					.arg(path)
+		match result {
+			Ok(output) if output.status.success() => Ok(()),
+			_ => {
+				// If regular unmount fails, try lazy unmount
+				let lazy_result = tokio::process::Command::new("umount")
+					.args(["-l", path.to_str().unwrap()])
 					.output()
 					.await
-					.map_err(|e| {
-						VolumeError::Platform(format!("udisksctl unmount failed: {}", e))
-					})?;
+					.map_err(|e| VolumeError::Platform(format!("Lazy unmount failed: {}", e)))?;
 
-				if udisks_result.status.success() {
+				if lazy_result.status.success() {
 					Ok(())
 				} else {
 					Err(VolumeError::Platform(format!(
-						"All unmount attempts failed: {}",
-						String::from_utf8_lossy(&udisks_result.stderr)
+						"Failed to unmount volume: {}",
+						String::from_utf8_lossy(&lazy_result.stderr)
 					)))
 				}
 			}
 		}
 	}
 }
+
 #[cfg(target_os = "windows")]
 pub mod windows {
 	use super::*;
 	use std::ffi::OsString;
-	use std::os::windows::ffi::OsStringExt;
-	use windows::Win32::Storage::FileSystem::{
-		GetDiskFreeSpaceExW, GetDriveTypeW, GetVolumeInformationW, DRIVE_FIXED, DRIVE_REMOTE,
-		DRIVE_REMOVABLE,
+	use std::path::PathBuf;
+
+	use ::windows::core::PCWSTR;
+	use ::windows::Win32::Storage::FileSystem::{
+		GetDiskFreeSpaceExW, GetDriveTypeW, GetVolumeInformationW,
 	};
-	use windows::Win32::System::Ioctl::STORAGE_PROPERTY_QUERY;
+	use ::windows::Win32::System::WindowsProgramming::{
+		DRIVE_FIXED, DRIVE_REMOTE, DRIVE_REMOVABLE,
+	};
+	use std::os::windows::ffi::OsStrExt;
 
 	pub async fn get_volumes() -> Vec<Volume> {
 		task::spawn_blocking(|| {
 			let mut volumes = Vec::new();
 
 			// Get available drives
-			let drives = unsafe { windows::Win32::Storage::FileSystem::GetLogicalDrives() };
+			let drives = unsafe { ::windows::Win32::Storage::FileSystem::GetLogicalDrives() };
 
 			for i in 0..26 {
 				if (drives & (1 << i)) != 0 {
@@ -332,7 +342,7 @@ pub mod windows {
 						.chain(std::iter::once(0))
 						.collect();
 
-					let drive_type = unsafe { GetDriveTypeW(wide_path.as_ptr()) };
+					let drive_type = unsafe { GetDriveTypeW(PCWSTR(wide_path.as_ptr())) };
 
 					// Skip CD-ROM drives and other unsupported types
 					if drive_type == DRIVE_FIXED
@@ -352,6 +362,13 @@ pub mod windows {
 		.unwrap_or_default()
 	}
 
+	fn detect_disk_type(path: &str) -> DiskType {
+		// We would need to use DeviceIoControl to get this information
+		// For brevity, returning Unknown, but you could implement the full detection
+		// using IOCTL_STORAGE_QUERY_PROPERTY
+		DiskType::Unknown
+	}
+
 	fn get_volume_info(path: &str, drive_type: u32) -> Option<Volume> {
 		let wide_path: Vec<u16> = OsString::from(path)
 			.encode_wide()
@@ -366,29 +383,25 @@ pub mod windows {
 
 		unsafe {
 			let success = GetVolumeInformationW(
-				wide_path.as_ptr(),
-				name_buf.as_mut_ptr(),
-				name_buf.len() as u32,
-				&mut serial_number,
-				&mut max_component_length,
-				&mut flags,
-				fs_name_buf.as_mut_ptr(),
-				fs_name_buf.len() as u32,
+				PCWSTR(wide_path.as_ptr()),
+				Some(name_buf.as_mut_slice()),
+				Some(&mut serial_number),
+				Some(&mut max_component_length),
+				Some(&mut flags),
+				Some(&mut fs_name_buf),
 			);
 
-			if success.as_bool() {
+			if let Ok(_) = success {
 				let mut total_bytes = 0;
 				let mut free_bytes = 0;
 				let mut available_bytes = 0;
 
-				if GetDiskFreeSpaceExW(
-					wide_path.as_ptr(),
-					&mut available_bytes,
-					&mut total_bytes,
-					&mut free_bytes,
-				)
-				.as_bool()
-				{
+				if let Ok(_) = GetDiskFreeSpaceExW(
+					PCWSTR(wide_path.as_ptr()),
+					Some(&mut available_bytes),
+					Some(&mut total_bytes),
+					Some(&mut free_bytes),
+				) {
 					let mount_type = match drive_type {
 						DRIVE_FIXED => MountType::System,
 						DRIVE_REMOVABLE => MountType::External,
@@ -412,10 +425,12 @@ pub mod windows {
 						},
 						mount_type,
 						PathBuf::from(path),
+						vec![PathBuf::from(path)],
 						detect_disk_type(path),
 						FileSystem::from_string(&fs_name),
-						total_bytes as u64,
-						available_bytes as u64,
+						total_bytes,
+						available_bytes,
+						false,
 					))
 				} else {
 					None
@@ -426,44 +441,40 @@ pub mod windows {
 		}
 	}
 
-	fn detect_disk_type(path: &str) -> DiskType {
-		// We would need to use DeviceIoControl to get this information
-		// For brevity, returning Unknown, but you could implement the full detection
-		// using IOCTL_STORAGE_QUERY_PROPERTY
-		DiskType::Unknown
-	}
 	pub async fn unmount_volume(path: &std::path::Path) -> Result<(), VolumeError> {
-		use std::ffi::OsStr;
-		use std::os::windows::ffi::OsStrExt;
-		use windows::core::PWSTR;
-		use windows::Win32::Storage::FileSystem::{
+		use ::windows::core::PWSTR;
+		use ::windows::Win32::Storage::FileSystem::{
 			DeleteVolumeMountPointW, GetVolumeNameForVolumeMountPointW,
 		};
+		use std::ffi::OsStr;
+		use std::os::windows::ffi::OsStrExt;
 
 		// Convert path to wide string for Windows API
-		let wide_path: Vec<u16> = OsStr::new(path)
+		let mut wide_path: Vec<u16> = OsStr::new(path)
 			.encode_wide()
 			.chain(std::iter::once(0))
 			.collect();
 
+		let wide_path_ptr = PWSTR(wide_path.as_mut_ptr());
+
 		unsafe {
 			// Buffer for volume name
 			let mut volume_name = [0u16; 50];
-			let mut volume_name_ptr = PWSTR(volume_name.as_mut_ptr());
 
 			// Get the volume name for the mount point
-			let result = GetVolumeNameForVolumeMountPointW(wide_path.as_ptr(), volume_name_ptr);
+			let result =
+				GetVolumeNameForVolumeMountPointW(wide_path_ptr, volume_name.as_mut_slice());
 
-			if !result.as_bool() {
+			if result.is_err() {
 				return Err(VolumeError::Platform(
 					"Failed to get volume name".to_string(),
 				));
 			}
 
 			// Delete the mount point
-			let result = DeleteVolumeMountPointW(wide_path.as_ptr());
+			let result = DeleteVolumeMountPointW(wide_path_ptr);
 
-			if result.as_bool() {
+			if let Ok(_) = result {
 				Ok(())
 			} else {
 				Err(VolumeError::Platform(
